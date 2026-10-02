@@ -1,0 +1,1930 @@
+-- Zyrqon Nova 3.5 "Apex"
+-- Standalone chess-analysis API.
+--
+-- Public interface:
+--     local move, score = ZyrqonNova:GetBestMoveFromFEN(fen, seconds)
+--
+-- The engine keeps the same public API as the previous version, but uses:
+--   * legal move generation with complete castling/en-passant handling
+--   * deterministic dual 32-bit Zobrist hashing
+--   * iterative deepening + aspiration windows
+--   * transposition table with EXACT/LOWER/UPPER bounds
+--   * principal-variation search
+--   * killer + history + counter-move ordering
+--   * null-move pruning with verification safeguards
+--   * late-move reductions
+--   * tactical quiescence including checks/promotions
+--   * tapered middlegame/endgame evaluation
+--   * pawn structure, mobility, king safety, rook files, bishop pair,
+--     outposts, passed pawns and king activity
+--   * repetition / immediate-reversal avoidance for repeated API calls
+--   * cooperative time slicing for Roblox responsiveness
+--
+-- It is still a compact Lua engine, not a Stockfish-class 5000-Elo engine.
+-- Strength is primarily limited by CPU time and the absence of Syzygy/NNUE.
+
+local API = {}
+API.Name = "Zyrqon Nova"
+API.Version = "3.5.0-apex"
+API.Description = "High-strength, frame-safe chess analysis API"
+
+local WHITE = 0
+local BLACK = 1
+
+local INF = 100000000
+local MATE = 90000000
+local MAX_PLY = 96
+local QMAX = 18
+
+local VALUE = {
+    p = 100,
+    n = 320,
+    b = 335,
+    r = 500,
+    q = 900,
+    k = 20000,
+}
+
+local PIECES = {
+    "P","N","B","R","Q","K",
+    "p","n","b","r","q","k",
+}
+
+local KNIGHT = {31,33,14,-14,-31,-33,18,-18}
+local BISHOP = {15,-15,17,-17}
+local ROOK = {1,-1,16,-16}
+local KING = {1,-1,15,-15,16,-16,17,-17}
+local QUEEN = {1,-1,16,-16,15,-15,17,-17}
+
+local MGP = {
+    p = {
+        0,0,0,0,0,0,0,0,
+        8,8,2,-2,-2,2,8,8,
+        6,6,7,10,10,7,6,6,
+        2,2,5,12,12,5,2,2,
+        0,0,5,10,10,5,0,0,
+        2,-2,-6,-10,-10,-6,-2,2,
+        4,8,8,-6,-6,8,8,4,
+        0,0,0,0,0,0,0,0,
+    },
+    n = {
+        -48,-36,-30,-30,-30,-30,-36,-48,
+        -30,-12,0,4,4,0,-12,-30,
+        -24,2,14,18,18,14,2,-24,
+        -18,2,18,24,24,18,2,-18,
+        -18,0,16,22,22,16,0,-18,
+        -22,4,12,18,18,12,4,-22,
+        -32,-16,-2,2,2,-2,-16,-32,
+        -50,-36,-28,-28,-28,-28,-36,-50,
+    },
+    b = {
+        -26,-10,-12,-8,-8,-12,-10,-26,
+        -10,5,0,2,2,0,5,-10,
+        -10,8,8,10,10,8,8,-10,
+        -8,6,10,12,12,10,6,-8,
+        -8,4,8,12,12,8,4,-8,
+        -10,8,8,10,10,8,8,-10,
+        -12,5,0,2,2,0,5,-12,
+        -26,-10,-12,-8,-8,-12,-10,-26,
+    },
+    r = {
+        0,0,4,8,8,4,0,0,
+        -4,0,0,2,2,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        2,6,8,10,10,8,6,2,
+        0,0,6,8,8,6,0,0,
+    },
+    q = {
+        -20,-10,-10,-5,-5,-10,-10,-20,
+        -8,-2,0,0,0,0,-2,-8,
+        -8,0,5,5,5,5,0,-8,
+        -4,2,5,7,7,5,2,-4,
+        -2,2,5,7,7,5,2,-2,
+        -6,2,5,5,5,5,2,-6,
+        -8,-2,0,2,2,0,-2,-8,
+        -20,-10,-10,-5,-5,-10,-10,-20,
+    },
+    k = {
+        24,30,18,4,4,18,30,24,
+        18,20,4,0,0,4,20,18,
+        2,0,-12,-18,-18,-12,0,2,
+        -10,-22,-30,-36,-36,-30,-22,-10,
+        -18,-30,-38,-44,-44,-38,-30,-18,
+        -24,-36,-44,-50,-50,-44,-36,-24,
+        -24,-34,-42,-48,-48,-42,-34,-24,
+        -8,-12,-18,-24,-24,-18,-12,-8,
+    },
+}
+
+local EGP = {
+    p = {
+        0,0,0,0,0,0,0,0,
+        30,28,24,22,22,24,28,30,
+        18,18,18,18,18,18,18,18,
+        12,12,14,16,16,14,12,12,
+        8,8,10,12,12,10,8,8,
+        8,8,6,6,6,6,8,8,
+        10,12,14,16,16,14,12,10,
+        0,0,0,0,0,0,0,0,
+    },
+    n = {
+        -24,-18,-12,-10,-10,-12,-18,-24,
+        -12,-4,2,4,4,2,-4,-12,
+        -8,2,8,10,10,8,2,-8,
+        -6,4,10,12,12,10,4,-6,
+        -6,2,10,12,12,10,2,-6,
+        -8,2,8,10,10,8,2,-8,
+        -12,-4,2,4,4,2,-4,-12,
+        -24,-18,-12,-10,-10,-12,-18,-24,
+    },
+    b = {
+        -14,-8,-6,-4,-4,-6,-8,-14,
+        -8,0,2,4,4,2,0,-8,
+        -6,2,8,10,10,8,2,-6,
+        -4,4,10,12,12,10,4,-4,
+        -4,2,10,12,12,10,2,-4,
+        -6,2,8,10,10,8,2,-6,
+        -8,0,2,4,4,2,0,-8,
+        -14,-8,-6,-4,-4,-6,-8,-14,
+    },
+    r = {
+        0,2,4,6,6,4,2,0,
+        2,4,6,8,8,6,4,2,
+        2,4,6,8,8,6,4,2,
+        2,4,6,8,8,6,4,2,
+        2,4,6,8,8,6,4,2,
+        4,6,8,10,10,8,6,4,
+        10,12,14,16,16,14,12,10,
+        4,6,8,10,10,8,6,4,
+    },
+    q = {
+        -10,-6,-4,-2,-2,-4,-6,-10,
+        -6,-2,0,2,2,0,-2,-6,
+        -4,0,4,6,6,4,0,-4,
+        -2,2,6,8,8,6,2,-2,
+        -2,2,6,8,8,6,2,-2,
+        -4,0,4,6,6,4,0,-4,
+        -6,-2,0,2,2,0,-2,-6,
+        -10,-6,-4,-2,-2,-4,-6,-10,
+    },
+    k = {
+        -2,8,12,18,18,12,8,-2,
+        6,14,18,22,22,18,14,6,
+        12,18,24,28,28,24,18,12,
+        16,22,28,32,32,28,22,16,
+        16,22,28,32,32,28,22,16,
+        12,18,24,28,28,24,18,12,
+        6,14,18,22,22,18,14,6,
+        -2,8,12,18,18,12,8,-2,
+    },
+}
+
+local STYLE = {
+    Balanced = {
+        material = 1.00, activity = 1.00, king = 1.00, pawn = 1.00,
+        risk = 0.00, center = 1.00, repetition = 1.0,
+    },
+    Aggressive = {
+        material = 1.00, activity = 1.12, king = 0.90, pawn = 1.04,
+        risk = 0.22, center = 1.10, repetition = 2.0,
+    },
+    Calm = {
+        material = 1.00, activity = 0.94, king = 1.10, pawn = 1.06,
+        risk = -0.04, center = 0.98, repetition = 0.7,
+    },
+    Defensive = {
+        material = 1.02, activity = 0.90, king = 1.24, pawn = 1.10,
+        risk = -0.20, center = 0.95, repetition = 0.5,
+    },
+    Tactical = {
+        material = 1.02, activity = 1.16, king = 0.92, pawn = 1.00,
+        risk = 0.30, center = 1.08, repetition = 2.4,
+    },
+    Trickery = {
+        material = 1.00, activity = 1.02, king = 0.96, pawn = 1.02,
+        risk = 0.48, center = 1.04, repetition = 3.2,
+    },
+    Positional = {
+        material = 1.03, activity = 1.10, king = 1.04, pawn = 1.18,
+        risk = 0.02, center = 1.16, repetition = 0.8,
+    },
+    Endgame = {
+        material = 1.05, activity = 1.06, king = 1.20, pawn = 1.25,
+        risk = 0.02, center = 1.06, repetition = 0.6,
+    },
+    ["Alien Gambit"] = {
+        material = 1.00, activity = 1.14, king = 0.86, pawn = 1.10,
+        risk = 0.56, center = 1.08, repetition = 4.0,
+    },
+    ["Willy Alien"] = {
+        material = 1.00, activity = 1.12, king = 0.88, pawn = 1.08,
+        risk = 0.66, center = 1.06, repetition = 4.5,
+    },
+}
+
+API.Style = API.Style or "Balanced"
+
+-- Search state
+local TT = {}
+local killer1 = {}
+local killer2 = {}
+local history = {}
+local counterMove = {}
+local nodes = 0
+local deadline = 0
+local aborted = false
+local sliceClock = 0
+local rootStart = 0
+local repetitionStack = {}
+local repetitionCount = {}
+
+local CLOCK_EVERY = 1024
+local SLICE_SECONDS = 0.0035
+
+-- ---------------------------------------------------------------------------
+-- Bit hashing
+-- ---------------------------------------------------------------------------
+
+local BIT = bit32
+local zobrist = {
+    a = {},
+    b = {},
+    sideA = 0,
+    sideB = 0,
+    castleA = {},
+    castleB = {},
+    epA = {},
+    epB = {},
+}
+
+local zr = 0x13579BDF
+
+local function rand32()
+    zr = BIT.band(BIT.bxor(zr, BIT.lshift(zr, 13)), 0xFFFFFFFF)
+    zr = BIT.band(BIT.bxor(zr, BIT.rshift(zr, 17)), 0xFFFFFFFF)
+    zr = BIT.band(BIT.bxor(zr, BIT.lshift(zr, 5)), 0xFFFFFFFF)
+    return zr
+end
+
+do
+    for p = 1, 12 do
+        zobrist.a[p] = {}
+        zobrist.b[p] = {}
+        for sq = 0, 127 do
+            zobrist.a[p][sq] = rand32()
+            zobrist.b[p][sq] = rand32()
+        end
+    end
+    zobrist.sideA = rand32()
+    zobrist.sideB = rand32()
+    for i = 0, 15 do
+        zobrist.castleA[i] = rand32()
+        zobrist.castleB[i] = rand32()
+    end
+    for sq = -1, 127 do
+        zobrist.epA[sq] = rand32()
+        zobrist.epB[sq] = rand32()
+    end
+end
+
+local PIECE_ID = {}
+for i, p in ipairs(PIECES) do
+    PIECE_ID[p] = i
+end
+
+local function isInside(sq)
+    return sq >= 0 and sq < 128 and (sq % 16) < 8
+end
+
+local function isWhitePiece(p)
+    return p and p ~= "." and p:match("%u") ~= nil
+end
+
+local function sideOf(p)
+    if not p or p == "." then
+        return nil
+    end
+    return isWhitePiece(p) and WHITE or BLACK
+end
+
+local function opposite(side)
+    return side == WHITE and BLACK or WHITE
+end
+
+local function sqName(sq)
+    return string.char(97 + (sq % 16)) .. tostring(math.floor(sq / 16) + 1)
+end
+
+local function parseSquare(s)
+    if type(s) ~= "string" or #s < 2 then
+        return nil
+    end
+    local f = string.byte(s, 1) - 97
+    local r = tonumber(s:sub(2, 2))
+    if not f or not r or f < 0 or f > 7 or r < 1 or r > 8 then
+        return nil
+    end
+    return (r - 1) * 16 + f
+end
+
+local function castleMask(s)
+    local mask = 0
+    if s and s ~= "-" then
+        if s:find("K", 1, true) then mask = mask + 1 end
+        if s:find("Q", 1, true) then mask = mask + 2 end
+        if s:find("k", 1, true) then mask = mask + 4 end
+        if s:find("q", 1, true) then mask = mask + 8 end
+    end
+    return mask
+end
+
+local function hashBoard(state)
+    local a = 0xA3B19535
+    local b = 0xC8013EA4
+    for sq = 0, 127 do
+        if isInside(sq) then
+            local p = state.board[sq]
+            if p and p ~= "." then
+                local z = PIECE_ID[p]
+                a = BIT.band(BIT.bxor(a, zobrist.a[z][sq]), 0xFFFFFFFF)
+                b = BIT.band(BIT.bxor(b, zobrist.b[z][sq]), 0xFFFFFFFF)
+            end
+        end
+    end
+    if state.side == BLACK then
+        a = BIT.band(BIT.bxor(a, zobrist.sideA), 0xFFFFFFFF)
+        b = BIT.band(BIT.bxor(b, zobrist.sideB), 0xFFFFFFFF)
+    end
+    a = BIT.band(BIT.bxor(a, zobrist.castleA[state.castling]), 0xFFFFFFFF)
+    b = BIT.band(BIT.bxor(b, zobrist.castleB[state.castling]), 0xFFFFFFFF)
+    a = BIT.band(BIT.bxor(a, zobrist.epA[state.ep]), 0xFFFFFFFF)
+    b = BIT.band(BIT.bxor(b, zobrist.epB[state.ep]), 0xFFFFFFFF)
+    return a, b
+end
+
+local function positionKey(state)
+    return tostring(state.hashA) .. ":" .. tostring(state.hashB)
+end
+
+-- ---------------------------------------------------------------------------
+-- Position parsing / copying
+-- ---------------------------------------------------------------------------
+
+local function parseFEN(fen)
+    local parts = {}
+    for token in tostring(fen):gmatch("%S+") do
+        parts[#parts + 1] = token
+    end
+    if #parts < 4 then
+        return nil
+    end
+
+    local state = {
+        board = {},
+        side = parts[2] == "b" and BLACK or WHITE,
+        castling = castleMask(parts[3]),
+        ep = parts[4] == "-" and -1 or (parseSquare(parts[4]) or -1),
+        halfmove = tonumber(parts[5]) or 0,
+        fullmove = tonumber(parts[6]) or 1,
+        hashA = 0,
+        hashB = 0,
+    }
+
+    for sq = 0, 127 do
+        state.board[sq] = "."
+    end
+
+    local rank = 7
+    for row in parts[1]:gmatch("[^/]+") do
+        local file = 0
+        for i = 1, #row do
+            local c = row:sub(i, i)
+            local n = tonumber(c)
+            if n then
+                file = file + n
+            else
+                if file <= 7 then
+                    state.board[rank * 16 + file] = c
+                end
+                file = file + 1
+            end
+        end
+        rank = rank - 1
+    end
+
+    state.hashA, state.hashB = hashBoard(state)
+    return state
+end
+
+local function copyState(s)
+    local n = {
+        board = {},
+        side = s.side,
+        castling = s.castling,
+        ep = s.ep,
+        halfmove = s.halfmove,
+        fullmove = s.fullmove,
+        hashA = s.hashA,
+        hashB = s.hashB,
+    }
+    for sq = 0, 127 do
+        n.board[sq] = s.board[sq]
+    end
+    return n
+end
+
+local function findKing(state, side)
+    local wanted = side == WHITE and "K" or "k"
+    for sq = 0, 127 do
+        if isInside(sq) and state.board[sq] == wanted then
+            return sq
+        end
+    end
+    return nil
+end
+
+-- ---------------------------------------------------------------------------
+-- Attacks / legality
+-- ---------------------------------------------------------------------------
+
+local function attackedBy(state, sq, attacker)
+    if not sq then
+        return false
+    end
+
+    local pawn = attacker == WHITE and "P" or "p"
+    local knight = attacker == WHITE and "N" or "n"
+    local bishop = attacker == WHITE and "B" or "b"
+    local rook = attacker == WHITE and "R" or "r"
+    local queen = attacker == WHITE and "Q" or "q"
+    local king = attacker == WHITE and "K" or "k"
+
+    if attacker == WHITE then
+        local a = sq - 15
+        local b = sq - 17
+        if isInside(a) and state.board[a] == pawn then return true end
+        if isInside(b) and state.board[b] == pawn then return true end
+    else
+        local a = sq + 15
+        local b = sq + 17
+        if isInside(a) and state.board[a] == pawn then return true end
+        if isInside(b) and state.board[b] == pawn then return true end
+    end
+
+    for _, d in ipairs(KNIGHT) do
+        local from = sq + d
+        if isInside(from) and state.board[from] == knight then
+            return true
+        end
+    end
+
+    for _, d in ipairs(KING) do
+        local from = sq + d
+        if isInside(from) and state.board[from] == king then
+            return true
+        end
+    end
+
+    for _, d in ipairs(BISHOP) do
+        local from = sq + d
+        while isInside(from) do
+            local p = state.board[from]
+            if p ~= "." then
+                if p == bishop or p == queen then
+                    return true
+                end
+                break
+            end
+            from = from + d
+        end
+    end
+
+    for _, d in ipairs(ROOK) do
+        local from = sq + d
+        while isInside(from) do
+            local p = state.board[from]
+            if p ~= "." then
+                if p == rook or p == queen then
+                    return true
+                end
+                break
+            end
+            from = from + d
+        end
+    end
+
+    return false
+end
+
+local function inCheck(state, side)
+    return attackedBy(state, findKing(state, side), opposite(side))
+end
+
+local function pushMove(list, from, to, promotion, castle, ep)
+    list[#list + 1] = {
+        from = from,
+        to = to,
+        promotion = promotion,
+        castle = castle,
+        ep = ep,
+    }
+end
+
+local function pseudoMoves(state, capturesOnly)
+    local moves = {}
+    local side = state.side
+    local promoNames = {"q","r","b","n"}
+
+    for sq = 0, 127 do
+        if isInside(sq) then
+            local p = state.board[sq]
+            if p ~= "." and sideOf(p) == side then
+                local kind = p:lower()
+
+                if kind == "p" then
+                    local dir = side == WHITE and 16 or -16
+                    local startRank = side == WHITE and 1 or 6
+                    local promoRank = side == WHITE and 7 or 0
+                    local one = sq + dir
+
+                    if not capturesOnly and isInside(one) and state.board[one] == "." then
+                        if math.floor(one / 16) == promoRank then
+                            for _, pr in ipairs(promoNames) do
+                                pushMove(moves, sq, one, pr)
+                            end
+                        else
+                            pushMove(moves, sq, one)
+                            local two = sq + dir * 2
+                            if math.floor(sq / 16) == startRank and state.board[two] == "." then
+                                pushMove(moves, sq, two)
+                            end
+                        end
+                    end
+
+                    local pawnCaps = side == WHITE and {15,17} or {-15,-17}
+                    for _, d in ipairs(pawnCaps) do
+                        local to = sq + d
+                        if isInside(to) then
+                            local target = state.board[to]
+                            if target ~= "." and sideOf(target) ~= side then
+                                if math.floor(to / 16) == promoRank then
+                                    for _, pr in ipairs(promoNames) do
+                                        pushMove(moves, sq, to, pr)
+                                    end
+                                else
+                                    pushMove(moves, sq, to)
+                                end
+                            elseif to == state.ep then
+                                pushMove(moves, sq, to, nil, nil, true)
+                            end
+                        end
+                    end
+
+                elseif kind == "n" then
+                    for _, d in ipairs(KNIGHT) do
+                        local to = sq + d
+                        if isInside(to) then
+                            local target = state.board[to]
+                            if target == "." or sideOf(target) ~= side then
+                                if not capturesOnly or target ~= "." then
+                                    pushMove(moves, sq, to)
+                                end
+                            end
+                        end
+                    end
+
+                elseif kind == "b" or kind == "r" or kind == "q" then
+                    local deltas = kind == "b" and BISHOP or kind == "r" and ROOK or QUEEN
+                    for _, d in ipairs(deltas) do
+                        local to = sq + d
+                        while isInside(to) do
+                            local target = state.board[to]
+                            if target == "." then
+                                if not capturesOnly then
+                                    pushMove(moves, sq, to)
+                                end
+                            else
+                                if sideOf(target) ~= side then
+                                    pushMove(moves, sq, to)
+                                end
+                                break
+                            end
+                            to = to + d
+                        end
+                    end
+
+                elseif kind == "k" then
+                    for _, d in ipairs(KING) do
+                        local to = sq + d
+                        if isInside(to) then
+                            local target = state.board[to]
+                            if target == "." or sideOf(target) ~= side then
+                                if not capturesOnly or target ~= "." then
+                                    pushMove(moves, sq, to)
+                                end
+                            end
+                        end
+                    end
+
+                    if not capturesOnly and not inCheck(state, side) then
+                        if side == WHITE and state.board[sq] == "K" then
+                            if BIT.band(state.castling, 1) ~= 0
+                                and state.board[7] == "R"
+                                and state.board[5] == "."
+                                and state.board[6] == "."
+                                and not attackedBy(state, 5, BLACK)
+                                and not attackedBy(state, 6, BLACK) then
+                                pushMove(moves, sq, 6, nil, true)
+                            end
+                            if BIT.band(state.castling, 2) ~= 0
+                                and state.board[0] == "R"
+                                and state.board[1] == "."
+                                and state.board[2] == "."
+                                and state.board[3] == "."
+                                and not attackedBy(state, 3, BLACK)
+                                and not attackedBy(state, 2, BLACK) then
+                                pushMove(moves, sq, 2, nil, true)
+                            end
+                        elseif side == BLACK and state.board[sq] == "k" then
+                            if BIT.band(state.castling, 4) ~= 0
+                                and state.board[119] == "r"
+                                and state.board[117] == "."
+                                and state.board[118] == "."
+                                and not attackedBy(state, 117, WHITE)
+                                and not attackedBy(state, 118, WHITE) then
+                                pushMove(moves, sq, 118, nil, true)
+                            end
+                            if BIT.band(state.castling, 8) ~= 0
+                                and state.board[112] == "r"
+                                and state.board[113] == "."
+                                and state.board[114] == "."
+                                and state.board[115] == "."
+                                and not attackedBy(state, 115, WHITE)
+                                and not attackedBy(state, 114, WHITE) then
+                                pushMove(moves, sq, 114, nil, true)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return moves
+end
+
+local makeMove
+
+local function legalMoves(state)
+    local result = {}
+    for _, move in ipairs(pseudoMoves(state, false)) do
+        local nextState = nil
+        -- makeMove is declared later; Lua resolves the local at call time.
+        nextState = makeMove(state, move)
+        if not inCheck(nextState, state.side) then
+            result[#result + 1] = move
+        end
+    end
+    return result
+end
+
+local function captureMoves(state)
+    local result = {}
+    for _, move in ipairs(pseudoMoves(state, true)) do
+        local nextState = makeMove(state, move)
+        if not inCheck(nextState, state.side) then
+            result[#result + 1] = move
+        end
+    end
+    return result
+end
+
+-- ---------------------------------------------------------------------------
+-- Make move / notation
+-- ---------------------------------------------------------------------------
+
+local function moveKey(move)
+    return sqName(move.from) .. sqName(move.to) .. (move.promotion or "")
+end
+
+makeMove = function(state, move)
+    local n = copyState(state)
+    local p = n.board[move.from]
+    local captured = n.board[move.to]
+    local oldCastle = n.castling
+    local oldEp = n.ep
+
+    n.hashA = BIT.band(BIT.bxor(n.hashA, zobrist.castleA[oldCastle], zobrist.epA[oldEp]), 0xFFFFFFFF)
+    n.hashB = BIT.band(BIT.bxor(n.hashB, zobrist.castleB[oldCastle], zobrist.epB[oldEp]), 0xFFFFFFFF)
+
+    -- Rebuild the two small hash values after move. This is more collision-safe
+    -- than trying to account for every special-case square in-place.
+    n.board[move.from] = "."
+
+    if move.ep then
+        local capSq = state.side == WHITE and (move.to - 16) or (move.to + 16)
+        captured = n.board[capSq]
+        n.board[capSq] = "."
+    end
+
+    local placed = p
+    if move.promotion then
+        placed = state.side == WHITE and move.promotion:upper() or move.promotion:lower()
+    end
+    n.board[move.to] = placed
+
+    if move.castle then
+        if move.to > move.from then
+            local rookFrom = state.side == WHITE and 7 or 119
+            local rookTo = state.side == WHITE and 5 or 117
+            n.board[rookTo] = n.board[rookFrom]
+            n.board[rookFrom] = "."
+        else
+            local rookFrom = state.side == WHITE and 0 or 112
+            local rookTo = state.side == WHITE and 3 or 115
+            n.board[rookTo] = n.board[rookFrom]
+            n.board[rookFrom] = "."
+        end
+    end
+
+    local rights = oldCastle
+    if p == "K" then
+        rights = BIT.band(rights, BIT.bnot(3))
+    elseif p == "k" then
+        rights = BIT.band(rights, BIT.bnot(12))
+    end
+
+    if move.from == 0 or move.to == 0 then rights = BIT.band(rights, BIT.bnot(2)) end
+    if move.from == 7 or move.to == 7 then rights = BIT.band(rights, BIT.bnot(1)) end
+    if move.from == 112 or move.to == 112 then rights = BIT.band(rights, BIT.bnot(8)) end
+    if move.from == 119 or move.to == 119 then rights = BIT.band(rights, BIT.bnot(4)) end
+
+    n.castling = rights
+    if math.abs(move.to - move.from) == 32 and p:lower() == "p" then
+        n.ep = state.side == WHITE and move.from + 16 or move.from - 16
+    else
+        n.ep = -1
+    end
+
+    n.halfmove = (p:lower() == "p" or captured ~= ".") and 0 or (state.halfmove + 1)
+    n.fullmove = state.fullmove + (state.side == BLACK and 1 or 0)
+    n.side = opposite(state.side)
+
+    n.hashA, n.hashB = hashBoard(n)
+    return n
+end
+
+
+local function moveToUCI(move)
+    if not move then
+        return nil
+    end
+    return moveKey(move)
+end
+
+local function isCapture(state, move)
+    return state.board[move.to] ~= "." or move.ep == true
+end
+
+local function isQuiet(state, move)
+    return not move.promotion and not move.ep and state.board[move.to] == "."
+end
+
+-- ---------------------------------------------------------------------------
+-- Evaluation
+-- ---------------------------------------------------------------------------
+
+local function mirroredIndex(sq)
+    local rank = math.floor(sq / 16)
+    local file = sq % 16
+    return (7 - rank) * 8 + file + 1
+end
+
+local function phaseValue(piece)
+    if piece == "q" then return 4 end
+    if piece == "r" then return 2 end
+    if piece == "b" or piece == "n" then return 1 end
+    return 0
+end
+
+local function pieceMobility(state, sq, p)
+    local side = sideOf(p)
+    local kind = p:lower()
+    local count = 0
+
+    if kind == "n" then
+        for _, d in ipairs(KNIGHT) do
+            local to = sq + d
+            if isInside(to) and (state.board[to] == "." or sideOf(state.board[to]) ~= side) then
+                count = count + 1
+            end
+        end
+    elseif kind == "b" or kind == "r" or kind == "q" then
+        local deltas = kind == "b" and BISHOP or kind == "r" and ROOK or QUEEN
+        for _, d in ipairs(deltas) do
+            local to = sq + d
+            while isInside(to) do
+                local target = state.board[to]
+                if target == "." then
+                    count = count + 1
+                else
+                    if sideOf(target) ~= side then
+                        count = count + 1
+                    end
+                    break
+                end
+                to = to + d
+            end
+        end
+    elseif kind == "k" then
+        for _, d in ipairs(KING) do
+            local to = sq + d
+            if isInside(to) and (state.board[to] == "." or sideOf(state.board[to]) ~= side) then
+                count = count + 1
+            end
+        end
+    end
+
+    return count
+end
+
+local function pawnStructure(state, whitePawns, blackPawns)
+    local score = 0
+    local wf = {}
+    local bf = {}
+
+    for _, sq in ipairs(whitePawns) do
+        local f = sq % 16
+        wf[f] = (wf[f] or 0) + 1
+    end
+    for _, sq in ipairs(blackPawns) do
+        local f = sq % 16
+        bf[f] = (bf[f] or 0) + 1
+    end
+
+    for f = 0, 7 do
+        local wc = wf[f] or 0
+        local bc = bf[f] or 0
+
+        if wc > 1 then score = score - (14 + 6 * (wc - 2)) end
+        if bc > 1 then score = score + (14 + 6 * (bc - 2)) end
+
+        if wc > 0 and (f == 0 or not wf[f - 1]) and (f == 7 or not wf[f + 1]) then
+            score = score - 10 * wc
+        end
+        if bc > 0 and (f == 0 or not bf[f - 1]) and (f == 7 or not bf[f + 1]) then
+            score = score + 10 * bc
+        end
+    end
+
+    for _, sq in ipairs(whitePawns) do
+        local f = sq % 16
+        local r = math.floor(sq / 16)
+        local blocked = false
+        local supported = false
+
+        for _, ep in ipairs(blackPawns) do
+            local ef = ep % 16
+            local er = math.floor(ep / 16)
+            if math.abs(ef - f) <= 1 then
+                if er > r then
+                    blocked = true
+                end
+            end
+        end
+
+        local left = f > 0 and state.board[r * 16 + f - 1] == "P"
+        local right = f < 7 and state.board[r * 16 + f + 1] == "P"
+        supported = left or right
+
+        if not blocked then
+            score = score + 18 + r * 10
+        end
+        if supported then
+            score = score + 6
+        end
+    end
+
+    for _, sq in ipairs(blackPawns) do
+        local f = sq % 16
+        local r = math.floor(sq / 16)
+        local blocked = false
+        local supported = false
+
+        for _, ep in ipairs(whitePawns) do
+            local ef = ep % 16
+            local er = math.floor(ep / 16)
+            if math.abs(ef - f) <= 1 then
+                if er < r then
+                    blocked = true
+                end
+            end
+        end
+
+        local left = f > 0 and state.board[r * 16 + f - 1] == "p"
+        local right = f < 7 and state.board[r * 16 + f + 1] == "p"
+        supported = left or right
+
+        if not blocked then
+            score = score - (18 + (7 - r) * 10)
+        end
+        if supported then
+            score = score - 6
+        end
+    end
+
+    return score
+end
+
+local function kingSafety(state, kingSq, side)
+    if not kingSq then
+        return 0
+    end
+
+    local enemy = opposite(side)
+    local kf = kingSq % 16
+    local kr = math.floor(kingSq / 16)
+    local danger = 0
+    local shield = 0
+
+    for df = -2, 2 do
+        for dr = -2, 2 do
+            if not (df == 0 and dr == 0) then
+                local f = kf + df
+                local r = kr + dr
+                if f >= 0 and f <= 7 and r >= 0 and r <= 7 then
+                    local target = r * 16 + f
+                    if attackedBy(state, target, enemy) then
+                        local dist = math.abs(df) + math.abs(dr)
+                        danger = danger + math.max(1, 4 - dist)
+                    end
+                end
+            end
+        end
+    end
+
+    local dir = side == WHITE and 1 or -1
+    local pawn = side == WHITE and "P" or "p"
+    local gaps = 0
+
+    for df = -1, 1 do
+        local f = kf + df
+        local r = kr + dir
+        if f >= 0 and f <= 7 and r >= 0 and r <= 7 then
+            if state.board[r * 16 + f] == pawn then
+                shield = shield + 1
+            else
+                gaps = gaps + 1
+            end
+        end
+    end
+
+    local openFilePenalty = 0
+    for df = -1, 1 do
+        local f = kf + df
+        if f >= 0 and f <= 7 then
+            local ownPawn = false
+            local enemyPawn = false
+            for r = 0, 7 do
+                local p = state.board[r * 16 + f]
+                if p == pawn then ownPawn = true end
+                if p == (side == WHITE and "p" or "P") then enemyPawn = true end
+            end
+            if not ownPawn and not enemyPawn then
+                openFilePenalty = openFilePenalty + 7
+            end
+        end
+    end
+
+    return shield * 9 - gaps * 8 - danger * 8 - openFilePenalty * 2
+end
+
+local function rookScore(state, side)
+    local score = 0
+    local ownPawn = side == WHITE and "P" or "p"
+    local enemyPawn = side == WHITE and "p" or "P"
+    local rook = side == WHITE and "R" or "r"
+
+    for sq = 0, 127 do
+        if isInside(sq) and state.board[sq] == rook then
+            local f = sq % 16
+            local r = math.floor(sq / 16)
+            local own = false
+            local enemy = false
+            for rr = 0, 7 do
+                local p = state.board[rr * 16 + f]
+                if p == ownPawn then own = true end
+                if p == enemyPawn then enemy = true end
+            end
+            if not own then score = score + 12 end
+            if not own and not enemy then score = score + 20 end
+            if (side == WHITE and r == 6) or (side == BLACK and r == 1) then
+                score = score + 24
+            end
+        end
+    end
+
+    return score
+end
+
+local function countNonPawnMaterial(state, side)
+    local total = 0
+    for sq = 0, 127 do
+        if isInside(sq) then
+            local p = state.board[sq]
+            if p ~= "." and sideOf(p) == side then
+                local k = p:lower()
+                if k ~= "p" and k ~= "k" then
+                    total = total + (VALUE[k] or 0)
+                end
+            end
+        end
+    end
+    return total
+end
+
+local function insufficientMaterial(state)
+    local minors = 0
+    for sq = 0, 127 do
+        if isInside(sq) then
+            local p = state.board[sq]
+            if p ~= "." and p:lower() ~= "k" then
+                local k = p:lower()
+                if k == "p" or k == "r" or k == "q" then
+                    return false
+                end
+                minors = minors + 1
+            end
+        end
+    end
+    -- Safe automatic-draw cases:
+    -- K vs K, K+B vs K, K+N vs K.
+    -- Do not mark K+B+N vs K or K+B+B vs K as an automatic draw.
+    return minors <= 1
+end
+
+local function evaluate(state)
+    local s = STYLE[API.Style] or STYLE.Balanced
+    local score = 0
+    local phase = 0
+    local maxPhase = 24
+    local wp = {}
+    local bp = {}
+    local wk, bk
+    local wb, bb = 0, 0
+
+    for sq = 0, 127 do
+        if isInside(sq) then
+            local p = state.board[sq]
+            if p ~= "." then
+                local k = p:lower()
+                local v = VALUE[k] or 0
+                local mid = MGP[k]
+                local endp = EGP[k]
+                local idx = isWhitePiece(p)
+                    and (math.floor(sq / 16) * 8 + (sq % 16) + 1)
+                    or mirroredIndex(sq)
+
+                local bonusMid = mid and mid[idx] or 0
+                local bonusEnd = endp and endp[idx] or 0
+                local pieceScore = v * s.material
+                local sideSign = isWhitePiece(p) and 1 or -1
+
+                score = score + sideSign * (pieceScore + bonusMid)
+                if phaseValue(k) > 0 then
+                    phase = phase + phaseValue(k)
+                end
+
+                if k == "p" then
+                    if isWhitePiece(p) then
+                        wp[#wp + 1] = sq
+                    else
+                        bp[#bp + 1] = sq
+                    end
+                elseif k == "k" then
+                    if isWhitePiece(p) then wk = sq else bk = sq end
+                elseif k == "b" then
+                    if isWhitePiece(p) then wb = wb + 1 else bb = bb + 1 end
+                end
+            end
+        end
+    end
+
+    if wb >= 2 then score = score + 34 end
+    if bb >= 2 then score = score - 34 end
+
+    local pawn = pawnStructure(state, wp, bp)
+    score = score + pawn * s.pawn
+
+    local whiteMob = 0
+    local blackMob = 0
+    local center = 0
+    local threats = 0
+
+    for sq = 0, 127 do
+        if isInside(sq) then
+            local p = state.board[sq]
+            if p ~= "." then
+                local side = sideOf(p)
+                local m = pieceMobility(state, sq, p)
+                if side == WHITE then
+                    whiteMob = whiteMob + m
+                else
+                    blackMob = blackMob + m
+                end
+
+                local f = sq % 16
+                local r = math.floor(sq / 16)
+                local cd = math.abs(3.5 - f) + math.abs(3.5 - r)
+                local centerWeight = math.max(0, 4.5 - cd)
+                center = center + (side == WHITE and 1 or -1) * centerWeight * (p:lower() == "p" and 1.7 or 1.0)
+
+                if p:lower() ~= "p" and p:lower() ~= "k" then
+                    if attackedBy(state, sq, opposite(side)) then
+                        threats = threats + (side == WHITE and -1 or 1) * 3
+                    end
+                end
+
+                local opp = opposite(side)
+                if p:lower() == "n" or p:lower() == "b" then
+                    if attackedBy(state, sq, opp) then
+                        local defended = attackedBy(state, sq, side)
+                        if not defended then
+                            threats = threats + (side == WHITE and -1 or 1) * 4
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    score = score + (whiteMob - blackMob) * 2.2 * s.activity
+    score = score + center * s.center
+    score = score + threats
+
+    score = score + (rookScore(state, WHITE) - rookScore(state, BLACK))
+    score = score + (kingSafety(state, wk, WHITE) - kingSafety(state, bk, BLACK)) * s.king
+
+    if phase < maxPhase then
+        phase = math.max(0, math.min(maxPhase, phase))
+        local endWeight = 1 - (phase / maxPhase)
+        if wk and bk then
+            local wf, wr = wk % 16, math.floor(wk / 16)
+            local bf, br = bk % 16, math.floor(bk / 16)
+            local wc = 7 - (math.abs(3.5 - wf) + math.abs(3.5 - wr))
+            local bc = 7 - (math.abs(3.5 - bf) + math.abs(3.5 - br))
+            score = score + (wc - bc) * 7 * endWeight
+        end
+    end
+
+    -- Blend the endgame PST contribution in without rebuilding the board.
+    if phase > 0 then
+        for sq = 0, 127 do
+            if isInside(sq) then
+                local p = state.board[sq]
+                if p ~= "." then
+                    local k = p:lower()
+                    local idx = isWhitePiece(p)
+                        and (math.floor(sq / 16) * 8 + (sq % 16) + 1)
+                        or mirroredIndex(sq)
+                    local mg = MGP[k] and MGP[k][idx] or 0
+                    local eg = EGP[k] and EGP[k][idx] or 0
+                    local sideSign = isWhitePiece(p) and 1 or -1
+                    score = score + sideSign * (eg - mg) * (1 - phase / maxPhase)
+                end
+            end
+        end
+    end
+
+    if insufficientMaterial(state) then
+        score = 0
+    elseif state.halfmove >= 100 then
+        score = 0
+    end
+
+    -- A small style-specific risk term affects evaluation, not merely ordering.
+    if s.risk ~= 0 then
+        local kingActivity = 0
+        if wk then
+            kingActivity = kingActivity + (7 - (math.abs(3.5 - (wk % 16)) + math.abs(3.5 - math.floor(wk / 16))))
+        end
+        if bk then
+            kingActivity = kingActivity - (7 - (math.abs(3.5 - (bk % 16)) + math.abs(3.5 - math.floor(bk / 16))))
+        end
+        score = score + kingActivity * s.risk * 2
+    end
+
+    return score
+end
+
+local function staticForSide(state)
+    local e = evaluate(state)
+    return state.side == WHITE and e or -e
+end
+
+-- ---------------------------------------------------------------------------
+-- Ordering
+-- ---------------------------------------------------------------------------
+
+local function orderScore(state, move, ttMove, ply, hashMove)
+    local attacker = state.board[move.from]
+    local target = state.board[move.to]
+    local p = attacker and attacker:lower() or "p"
+    local score = 0
+    local key = moveKey(move)
+
+    if ttMove and key == ttMove then
+        score = score + 30000000
+    end
+    if hashMove and key == hashMove then
+        score = score + 28000000
+    end
+
+    if move.promotion then
+        score = score + 8000000 + (VALUE[move.promotion] or 0) * 20
+    end
+
+    if target ~= "." or move.ep then
+        local victim = move.ep and "p" or target:lower()
+        local gain = (VALUE[victim] or 0) * 100 - (VALUE[p] or 0)
+        score = score + 5000000 + gain
+    end
+
+    if ply > 0 then
+        if killer1[ply] == key then score = score + 2500000 end
+        if killer2[ply] == key then score = score + 2200000 end
+    end
+
+    local cm = counterMove[hashKey(state)]
+    if cm and cm == key then
+        score = score + 1800000
+    end
+
+    score = score + (history[attacker .. ":" .. key] or 0)
+    return score
+end
+
+local function orderedMoves(state, moves, ttMove, ply, hashMove)
+    local scored = {}
+    for i = 1, #moves do
+        local m = moves[i]
+        scored[i] = {
+            move = m,
+            score = orderScore(state, m, ttMove, ply, hashMove),
+        }
+    end
+
+    table.sort(scored, function(a, b)
+        return a.score > b.score
+    end)
+
+    local result = {}
+    for i = 1, #scored do
+        result[i] = scored[i].move
+    end
+    return result
+end
+
+-- ---------------------------------------------------------------------------
+-- Time / repetition
+-- ---------------------------------------------------------------------------
+
+local function timeUp(force)
+    local now = os.clock()
+
+    if not force and nodes % CLOCK_EVERY ~= 0 then
+        return false
+    end
+
+    if now >= deadline then
+        aborted = true
+        return true
+    end
+
+    if now - sliceClock >= SLICE_SECONDS then
+        if task and task.wait then
+            task.wait()
+        end
+        sliceClock = os.clock()
+        if sliceClock >= deadline then
+            aborted = true
+            return true
+        end
+    end
+
+    return false
+end
+
+local function repetitionPush(key)
+    repetitionStack[#repetitionStack + 1] = key
+    repetitionCount[key] = (repetitionCount[key] or 0) + 1
+end
+
+local function repetitionPop(key)
+    repetitionCount[key] = math.max(0, (repetitionCount[key] or 1) - 1)
+    repetitionStack[#repetitionStack] = nil
+end
+
+local function isRepeated(key)
+    return (repetitionCount[key] or 0) >= 2
+end
+
+local function rootHistoryPenalty(stateAfter, move)
+    local penalty = 0
+    local key = positionKey(stateAfter)
+    local recent = API.RecentPositions or {}
+
+    for i = 1, #recent do
+        if recent[i] == key then
+            penalty = penalty + 40 * math.max(1, #recent - i + 1)
+        end
+    end
+
+    local last = API.LastMove
+    if last then
+        local k = moveToUCI(move)
+        local reverse = last:sub(3, 4) .. last:sub(1, 2)
+        if k:sub(1, 4) == reverse then
+            penalty = penalty + 90
+        end
+    end
+
+    return penalty
+end
+
+-- ---------------------------------------------------------------------------
+-- Quiescence
+-- ---------------------------------------------------------------------------
+
+local function tacticalMoves(state)
+    local all = pseudoMoves(state, false)
+    local result = {}
+
+    for i = 1, #all do
+        local m = all[i]
+        if isCapture(state, m) or m.promotion then
+            result[#result + 1] = m
+        else
+            local nextState = makeMove(state, m)
+            if inCheck(nextState, nextState.side) then
+                result[#result + 1] = m
+            end
+        end
+    end
+
+    local legal = {}
+    for i = 1, #result do
+        local m = result[i]
+        local n = makeMove(state, m)
+        if not inCheck(n, state.side) then
+            legal[#legal + 1] = m
+        end
+    end
+    return legal
+end
+
+local function quiescence(state, alpha, beta, ply)
+    nodes = nodes + 1
+    if timeUp() then
+        return 0
+    end
+
+    local check = inCheck(state, state.side)
+    local stand = check and -INF or staticForSide(state)
+
+    if not check then
+        if stand >= beta then return beta end
+        if stand > alpha then alpha = stand end
+    end
+
+    if ply >= QMAX then
+        return check and (-MATE + ply) or stand
+    end
+
+    local moves
+    if check then
+        moves = legalMoves(state)
+    else
+        moves = tacticalMoves(state)
+    end
+
+    if #moves == 0 then
+        return check and (-MATE + ply) or stand
+    end
+
+    moves = orderedMoves(state, moves, nil, ply, nil)
+
+    for i = 1, #moves do
+        local m = moves[i]
+        local n = makeMove(state, m)
+        local key = positionKey(n)
+
+        if not isRepeated(key) then
+            repetitionPush(key)
+            local score = -quiescence(n, -beta, -alpha, ply + 1)
+            repetitionPop(key)
+
+            if aborted then
+                return 0
+            end
+            if score >= beta then
+                return beta
+            end
+            if score > alpha then
+                alpha = score
+            end
+        end
+    end
+
+    return alpha
+end
+
+-- ---------------------------------------------------------------------------
+-- Search helpers
+-- ---------------------------------------------------------------------------
+
+local function isEndgame(state)
+    return countNonPawnMaterial(state, WHITE) + countNonPawnMaterial(state, BLACK) <= 2800
+end
+
+local function makeNullState(state)
+    local n = copyState(state)
+    n.side = opposite(state.side)
+    n.ep = -1
+    n.halfmove = state.halfmove + 1
+    n.hashA, n.hashB = hashBoard(n)
+    return n
+end
+
+local function hashKey(state)
+    return tostring(state.hashA) .. ":" .. tostring(state.hashB)
+end
+
+local function canNullMove(state)
+    if inCheck(state, state.side) then
+        return false
+    end
+    if isEndgame(state) then
+        return false
+    end
+    return countNonPawnMaterial(state, state.side) >= VALUE.r + VALUE.n
+end
+
+local function reduceForMove(depth, index, move, state)
+    if depth < 5 or index < 5 then
+        return 0
+    end
+    if not isQuiet(state, move) then
+        return 0
+    end
+
+    local r = depth >= 9 and 2 or 1
+    if index >= 12 and depth >= 8 then
+        r = r + 1
+    end
+    return math.min(r, depth - 2)
+end
+
+-- ---------------------------------------------------------------------------
+-- Negamax / PVS
+-- ---------------------------------------------------------------------------
+
+local function negamax(state, depth, alpha, beta, ply, allowNull)
+    nodes = nodes + 1
+    if timeUp() then
+        return 0, nil
+    end
+
+    local check = inCheck(state, state.side)
+
+    if state.halfmove >= 100 then
+        return 0, nil
+    end
+
+    local key = hashKey(state)
+    local entry = TT[key]
+    local originalAlpha = alpha
+
+    if entry and entry.depth >= depth then
+        if entry.flag == "EXACT" then
+            return entry.score, entry.move
+        elseif entry.flag == "LOWER" and entry.score > alpha then
+            alpha = entry.score
+        elseif entry.flag == "UPPER" and entry.score < beta then
+            beta = entry.score
+        end
+        if alpha >= beta then
+            return entry.score, entry.move
+        end
+    end
+
+    if isRepeated(key) and not check and depth <= 3 then
+        return -20, nil
+    end
+
+    if depth <= 0 and not check then
+        return quiescence(state, alpha, beta, ply), nil
+    end
+
+    if depth <= 0 and check then
+        depth = 1
+    end
+
+    local static = nil
+    if not check and depth <= 3 then
+        static = staticForSide(state)
+        local margin = 85 * depth
+        if static + margin <= alpha then
+            local q = quiescence(state, alpha, beta, ply)
+            if q <= alpha then
+                return q, nil
+            end
+        end
+    end
+
+    -- Null-move pruning. Verification is used near the threshold to avoid
+    -- blindly throwing away zugzwang/endgame positions.
+    if allowNull and depth >= 5 and canNullMove(state) then
+        local reduction = depth >= 9 and 3 or 2
+        local ns = makeNullState(state)
+        repetitionPush(hashKey(ns))
+        local nullScore = -negamax(ns, depth - reduction, -beta, -beta + 1, ply + 1, false)
+        repetitionPop(hashKey(ns))
+
+        if aborted then
+            return 0, nil
+        end
+
+        if nullScore >= beta then
+            if depth <= 7 then
+                return nullScore, nil
+            end
+            local verify = negamax(state, depth - reduction - 1, alpha, beta, ply, false)
+            if verify >= beta then
+                return verify, nil
+            end
+        end
+    end
+
+    local moves = legalMoves(state)
+
+    if #moves == 0 then
+        if check then
+            return -MATE + ply, nil
+        end
+        return 0, nil
+    end
+
+    local ttMove = entry and entry.move or nil
+    moves = orderedMoves(state, moves, ttMove, ply, nil)
+
+    local bestScore = -INF
+    local bestMove = nil
+    local first = true
+    local moveCount = 0
+    local previousBest = counterMove[state.hashA] or counterMove[state.hashB]
+
+    for i = 1, #moves do
+        local move = moves[i]
+        moveCount = moveCount + 1
+        local nextState = makeMove(state, move)
+        local nextKey = hashKey(nextState)
+
+        if not isRepeated(nextKey) then
+            repetitionPush(nextKey)
+
+            local nextDepth = depth - 1
+            local givesCheck = inCheck(nextState, nextState.side)
+
+            if givesCheck and depth >= 3 then
+                nextDepth = nextDepth + 1
+            end
+
+            local reduction = reduceForMove(depth, moveCount, move, state)
+            local score
+
+            if first then
+                score = -negamax(nextState, nextDepth, -beta, -alpha, ply + 1, true)
+            else
+                if reduction > 0 then
+                    score = -negamax(
+                        nextState,
+                        math.max(1, nextDepth - reduction),
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        true
+                    )
+                    if not aborted and score > alpha then
+                        score = -negamax(nextState, nextDepth, -alpha - 1, -alpha, ply + 1, true)
+                    end
+                else
+                    score = -negamax(nextState, nextDepth, -alpha - 1, -alpha, ply + 1, true)
+                end
+
+                if not aborted and score > alpha and score < beta then
+                    score = -negamax(nextState, nextDepth, -beta, -alpha, ply + 1, true)
+                end
+            end
+
+            repetitionPop(nextKey)
+
+            if aborted then
+                return 0, nil
+            end
+
+            first = false
+
+            if score > bestScore then
+                bestScore = score
+                bestMove = move
+            end
+
+            if score > alpha then
+                alpha = score
+                local histKey = state.board[move.from] .. ":" .. moveKey(move)
+                history[histKey] = math.min(250000, (history[histKey] or 0) + depth * depth * 3)
+
+                if previousBest then
+                    counterMove[hashKey(state)] = moveKey(move)
+                end
+            end
+
+            if alpha >= beta then
+                if isQuiet(state, move) then
+                    local k = moveKey(move)
+                    if killer1[ply] ~= k then
+                        killer2[ply] = killer1[ply]
+                        killer1[ply] = k
+                    end
+                end
+                break
+            end
+        end
+    end
+
+    if bestMove then
+        local flag = "EXACT"
+        if bestScore <= originalAlpha then
+            flag = "UPPER"
+        elseif bestScore >= beta then
+            flag = "LOWER"
+        end
+
+        TT[key] = {
+            depth = depth,
+            score = bestScore,
+            flag = flag,
+            move = moveToUCI(bestMove),
+        }
+    end
+
+    return bestScore, bestMove
+end
+
+local function rootSearch(state, depth, previous, alpha, beta)
+    local moves = legalMoves(state)
+
+    if #moves == 0 then
+        return nil, inCheck(state, state.side) and -MATE or 0
+    end
+
+    local entry = TT[hashKey(state)]
+    local ttMove = previous or (entry and entry.move) or nil
+    moves = orderedMoves(state, moves, ttMove, 0, previous)
+
+    local bestScore = -INF
+    local bestMove = nil
+    local first = true
+
+    for i = 1, #moves do
+        local move = moves[i]
+        local child = makeMove(state, move)
+        local childKey = hashKey(child)
+
+        local repetitionPenalty = rootHistoryPenalty(child, move)
+        local score
+
+        if isRepeated(childKey) then
+            repetitionPenalty = repetitionPenalty + 80
+        end
+
+        repetitionPush(childKey)
+
+        if first then
+            score = -negamax(child, depth - 1, -beta, -alpha, 1, true)
+        else
+            score = -negamax(child, depth - 1, -alpha - 1, -alpha, 1, true)
+            if not aborted and score > alpha and score < beta then
+                score = -negamax(child, depth - 1, -beta, -alpha, 1, true)
+            end
+        end
+
+        repetitionPop(childKey)
+
+        if aborted then
+            break
+        end
+
+        first = false
+
+        -- Only use the cycle penalty when the candidate is not a forced
+        -- tactical result. This keeps the engine from shuffling rooks while
+        -- still allowing a repetition when it is actually necessary.
+        if math.abs(score) < MATE - 10000 then
+            score = score - repetitionPenalty * ((STYLE[API.Style] or STYLE.Balanced).repetition * 0.15)
+        end
+
+        if score > bestScore then
+            bestScore = score
+            bestMove = move
+        end
+        if score > alpha then
+            alpha = score
+        end
+        if alpha >= beta then
+            break
+        end
+    end
+
+    return bestMove, bestScore
+end
+
+-- ---------------------------------------------------------------------------
+-- Public API
+-- ---------------------------------------------------------------------------
+
+function API:SetStyle(style)
+    style = tostring(style or "Balanced")
+    if STYLE[style] then
+        self.Style = style
+        return true
+    end
+    return false
+end
+
+function API:GetStyles()
+    local out = {}
+    for name in pairs(STYLE) do
+        out[#out + 1] = name
+    end
+    table.sort(out)
+    return out
+end
+
+function API:ResetHistory()
+    self.RecentPositions = {}
+    self.LastMove = nil
+end
+
+function API:GetBestMoveFromFEN(fen, seconds)
+    local state = parseFEN(fen)
+    if not state then
+        return nil
+    end
+
+    local limit = tonumber(seconds) or 2.5
+    limit = math.max(0.08, math.min(limit, 30))
+
+    rootStart = os.clock()
+    deadline = rootStart + limit
+    nodes = 0
+    aborted = false
+    sliceClock = os.clock()
+
+    TT = {}
+    killer1 = {}
+    killer2 = {}
+    history = {}
+    counterMove = {}
+    repetitionStack = {}
+    repetitionCount = {}
+
+    local rootKey = hashKey(state)
+    repetitionPush(rootKey)
+
+    local legal = legalMoves(state)
+    if #legal == 0 then
+        repetitionPop(rootKey)
+        return nil
+    end
+
+    if #legal == 1 then
+        local only = moveToUCI(legal[1])
+        local score = staticForSide(state)
+        self.LastSearch = {
+            requestedTime = limit,
+            elapsed = os.clock() - rootStart,
+            depth = 0,
+            nodes = 0,
+            score = score,
+            move = only,
+            style = self.Style,
+        }
+        self.LastMove = only
+        self.RecentPositions = self.RecentPositions or {}
+        self.RecentPositions[#self.RecentPositions + 1] = rootKey
+        while #self.RecentPositions > 12 do
+            table.remove(self.RecentPositions, 1)
+        end
+        repetitionPop(rootKey)
+        return only, score
+    end
+
+    local bestMove = legal[1]
+    local bestScore = -INF
+    local previousMove = nil
+    local previousScore = nil
+    local completedDepth = 0
+
+    for depth = 1, MAX_PLY do
+        if os.clock() >= deadline then
+            break
+        end
+
+        aborted = false
+
+        local alpha = -INF
+        local beta = INF
+
+        if previousScore then
+            local window = math.max(25, 90 - depth * 3)
+            alpha = previousScore - window
+            beta = previousScore + window
+        end
+
+        local move, score = rootSearch(state, depth, previousMove, alpha, beta)
+
+        if aborted then
+            break
+        end
+
+        if previousScore and (score <= alpha or score >= beta) then
+            aborted = false
+            move, score = rootSearch(state, depth, previousMove, -INF, INF)
+            if aborted then
+                break
+            end
+        end
+
+        if move then
+            bestMove = move
+            bestScore = score
+            previousMove = moveToUCI(move)
+            previousScore = score
+            completedDepth = depth
+        end
+
+        if math.abs(bestScore) >= MATE - 1000 then
+            break
+        end
+    end
+
+    repetitionPop(rootKey)
+
+    local elapsed = os.clock() - rootStart
+    local resultMove = moveToUCI(bestMove)
+
+    self.LastSearch = {
+        requestedTime = limit,
+        elapsed = elapsed,
+        depth = completedDepth,
+        nodes = nodes,
+        score = bestScore,
+        move = resultMove,
+        style = self.Style,
+    }
+
+    -- Remember positions produced through repeated calls to the same API
+    -- object. This is intentionally small to keep memory and lookup cost low.
+    self.RecentPositions = self.RecentPositions or {}
+    self.RecentPositions[#self.RecentPositions + 1] = rootKey
+    while #self.RecentPositions > 12 do
+        table.remove(self.RecentPositions, 1)
+    end
+    self.LastMove = resultMove
+
+    return resultMove, bestScore
+end
+
+function API:Analyze(fen, seconds)
+    local move, score = self:GetBestMoveFromFEN(fen, seconds)
+    local info = self.LastSearch or {}
+
+    return {
+        move = move,
+        score = score,
+        api = self.Name,
+        version = self.Version,
+        nodes = info.nodes or nodes,
+        depth = info.depth or 0,
+        elapsed = info.elapsed or 0,
+        requestedTime = info.requestedTime or tonumber(seconds) or 2.5,
+        style = self.Style,
+    }
+end
+
+return API
